@@ -1,0 +1,7 @@
+button.candidate-card {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+}

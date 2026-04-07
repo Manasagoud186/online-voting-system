@@ -32,7 +32,10 @@ console.log("🔐 Secrets configured from .env");
 
 // 1. CORS FIRST
 app.use(cors({
-    origin: "*",
+    origin: function (origin, callback) {
+        // Reflect the incoming origin or allow default local
+        callback(null, true);
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
@@ -56,6 +59,8 @@ app.use((req, res, next) => {
 const publicPath = path.join(__dirname, "public");
 const frontendPath = path.join(__dirname, "frontend");
 const adminPath = path.join(__dirname, "admin");
+const reactDist = path.join(__dirname, "client", "dist");
+const useReactClient = fs.existsSync(path.join(reactDist, "index.html"));
 
 // Create folders
 [publicPath, path.join(publicPath, "uploads"), path.join(publicPath, "uploads", "candidates")].forEach(folder => {
@@ -65,21 +70,26 @@ const adminPath = path.join(__dirname, "admin");
 });
 
 console.log("\n📁 Static file paths:");
-console.log("   Frontend:", frontendPath);
-console.log("   Admin:", adminPath);
 console.log("   Public:", publicPath);
-
-// SERVE STATIC FILES - ORDER MATTERS!
-// Frontend files (highest priority)
-app.use(express.static(frontendPath));
-
-// Admin files
-if (fs.existsSync(adminPath)) {
-    app.use("/admin", express.static(adminPath));
+if (useReactClient) {
+    console.log("   React SPA:", reactDist);
+} else {
+    console.log("   Frontend:", frontendPath);
+    console.log("   Admin:", adminPath);
 }
 
-// Public uploads
+// Uploads first (shared by API + client)
 app.use("/uploads", express.static(path.join(publicPath, "uploads")));
+
+if (useReactClient) {
+    app.use(express.static(reactDist));
+} else {
+    app.use(express.static(frontendPath));
+    if (fs.existsSync(adminPath)) {
+        app.use("/admin", express.static(adminPath));
+    }
+}
+
 app.use(express.static(publicPath));
 
 console.log("✅ Static files configured\n");
@@ -90,14 +100,31 @@ console.log("✅ Static files configured\n");
 require("dotenv").config();
 
 const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'voting_system',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
+
+/**
+ * Helper to calculate election status dynamically based on time
+ */
+const getCalculatedStatus = (dbStatus, startTime, endTime) => {
+    if (dbStatus === 'PAUSED') return 'PAUSED';
+    if (dbStatus === 'CLOSED') return 'CLOSED';
+
+    const now = new Date();
+    const start = startTime ? new Date(startTime) : null;
+    const end = endTime ? new Date(endTime) : null;
+
+    if (start && now < start) return 'UPCOMING';
+    if (end && now > end) return 'CLOSED';
+
+    return dbStatus; // usually ACTIVE
+};
 if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME) {
     console.error("❌ FATAL ERROR: Database credentials not found in .env file!");
     console.error("Please create .env file with required database credentials.");
@@ -137,6 +164,36 @@ const authenticateVoter = (req, res, next) => {
     }
 };
 
+const authenticateAdmin = (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) {
+            return res.status(401).json({ success: false, message: "No authorization header" });
+        }
+
+        const token = authHeader.split(" ")[1];
+        if (!token) {
+            return res.status(401).json({ success: false, message: "No token" });
+        }
+
+        const decoded = jwt.verify(token, ADMIN_JWT_SECRET);
+        req.admin = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({ success: false, message: "Invalid token" });
+    }
+};
+
+const uploadCandidateImage = multer({
+    storage: multer.diskStorage({
+        destination: path.join(__dirname, "public", "uploads", "candidates"),
+        filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+        }
+    })
+});
+
 // ===========================
 // API ROUTES
 // ===========================
@@ -171,6 +228,27 @@ app.post("/api/auth/register", async (req, res) => {
                 success: false,
                 message: "Password too short"
             });
+        }
+
+        // Age validation: must be 18 to 98 years old
+        if (dateOfBirth) {
+            const dob = new Date(dateOfBirth);
+            const today = new Date();
+            let age = today.getFullYear() - dob.getFullYear();
+            const m = today.getMonth() - dob.getMonth();
+            if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) age--;
+            if (isNaN(age) || age < 18) {
+                return res.status(400).json({
+                    success: false,
+                    message: "You must be at least 18 years old to register"
+                });
+            }
+            if (age > 98) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Date of birth year is too far in the past (max age is 98)"
+                });
+            }
         }
 
         conn = await pool.getConnection();
@@ -355,7 +433,7 @@ app.get("/api/voters/candidates", authenticateVoter, async (req, res) => {
                     id: 0,
                     name: "NOTA",
                     party: "None of the Above",
-                    partySymbol: "✋",
+                    partySymbol: "❌",
                     biography: "Vote for none",
                     imageUrl: "https://via.placeholder.com/200?text=NOTA",
                     votes: 0,
@@ -393,15 +471,18 @@ app.post("/api/voters/vote", authenticateVoter, async (req, res) => {
 
         conn = await pool.getConnection();
 
-        const [election] = await conn.query(
-            "SELECT status FROM election_control ORDER BY id DESC LIMIT 1"
+        const [[statusRow]] = await conn.query(
+            "SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1"
         );
 
-        if (!election.length || election[0].status !== 'ACTIVE') {
+        const currentStatus = statusRow ? getCalculatedStatus(statusRow.status, statusRow.start_time, statusRow.end_time) : 'CLOSED';
+
+        if (currentStatus !== 'ACTIVE') {
             conn.release();
             return res.status(400).json({
                 success: false,
-                message: "Election not active"
+                message: currentStatus === 'UPCOMING' ? "Election has not started yet" : "Election is closed or paused",
+                status: currentStatus
             });
         }
 
@@ -478,29 +559,61 @@ app.get("/api/voters/results", authenticateVoter, async (req, res) => {
 
         conn = await pool.getConnection();
 
+        // Get candidates with their vote counts from the candidates table
         const [candidates] = await conn.query(
-            `SELECT id, name, party, party_symbol, image_url, votes 
-             FROM candidates 
+            `SELECT id, name, party, party_symbol as partySymbol, image_url as imageUrl, votes
+             FROM candidates
+             WHERE status = 'active'
              ORDER BY votes DESC`
         );
 
+        // Count NOTA votes (where candidate_id is NULL)
+        const [[{ notaVotes }]] = await conn.query(
+            "SELECT COUNT(*) as notaVotes FROM votes WHERE candidate_id IS NULL"
+        );
+
+        // Get election status
+        const [[statusRow]] = await conn.query("SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1");
+        const electionStatus = statusRow ? getCalculatedStatus(statusRow.status, statusRow.start_time, statusRow.end_time) : 'CLOSED';
+
+        // Count total voters
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as totalVoters FROM voters");
+
         conn.release();
 
-        const totalVotes = candidates.reduce((sum, c) => sum + (c.votes || 0), 0);
+        const totalVotes = candidates.reduce((sum, c) => sum + (c.votes || 0), 0) + (notaVotes || 0);
+
+        const results = candidates.map(c => ({
+            id: c.id,
+            name: c.name,
+            party: c.party,
+            partySymbol: c.partySymbol || "🏛️",
+            imageUrl: c.imageUrl || "https://via.placeholder.com/200?text=Candidate",
+            votes: c.votes || 0,
+            percentage: totalVotes > 0 ? Math.round((c.votes / totalVotes) * 100) : 0,
+            isNota: false
+        }));
+
+        // Add NOTA to results if there are any NOTA votes or if candidates exist
+        results.push({
+            id: 0,
+            name: "NOTA",
+            party: "None of the Above",
+            partySymbol: "❌",
+            imageUrl: "https://via.placeholder.com/200?text=NOTA",
+            votes: notaVotes || 0,
+            percentage: totalVotes > 0 ? Math.round((notaVotes / totalVotes) * 100) : 0,
+            isNota: true
+        });
+
+        // Re-sort to include NOTA in rankings
+        results.sort((a, b) => b.votes - a.votes);
 
         console.log("✅ Results retrieved");
 
         res.json({
             success: true,
-            results: candidates.map(c => ({
-                id: c.id,
-                name: c.name,
-                party: c.party,
-                partySymbol: c.party_symbol || "🏛️",
-                imageUrl: c.image_url || "https://via.placeholder.com/200?text=Candidate",
-                votes: c.votes || 0,
-                percentage: totalVotes > 0 ? Math.round((c.votes / totalVotes) * 100) : 0
-            })),
+            results,
             totalVotes
         });
 
@@ -567,126 +680,569 @@ app.get("/api/voters/profile", authenticateVoter, async (req, res) => {
     }
 });
 
-// ELECTION STATUS
-app.get("/api/admin/election-status", authenticateVoter, async (req, res) => {
+// ELECTION STATUS (Public)
+app.get("/api/admin/election-status", async (req, res) => {
     let conn = null;
     try {
-        console.log("📋 Election status");
+        conn = await pool.getConnection();
+        const [[statusRow]] = await conn.query("SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1");
+        conn.release();
+
+        if (!statusRow) {
+            return res.json({ success: true, status: 'CLOSED', startTime: null, endTime: null });
+        }
+
+        const calculatedStatus = getCalculatedStatus(statusRow.status, statusRow.start_time, statusRow.end_time);
+
+        res.json({
+            success: true,
+            status: calculatedStatus,
+            startTime: statusRow.start_time,
+            endTime: statusRow.end_time
+        });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - LOGIN
+app.post("/api/admin/login", async (req, res) => {
+    let conn = null;
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required" });
+
+        conn = await pool.getConnection();
+        const [admins] = await conn.query("SELECT * FROM admins WHERE email = ?", [email.toLowerCase()]);
+        if (admins.length === 0) {
+            conn.release();
+            return res.status(401).json({ success: false, message: "Invalid credentials" });
+        }
+        const admin = admins[0];
+        const isValid = await bcrypt.compare(password, admin.password);
+        if (!isValid) {
+            conn.release();
+            return res.status(401).json({ success: false, message: "Invalid credentials" });
+        }
+        conn.release();
+        const token = jwt.sign({ id: admin.id, email: admin.email, role: "admin" }, ADMIN_JWT_SECRET, { expiresIn: "12h" });
+        res.json({ success: true, message: "Login successful", token, admin: { id: admin.id, name: admin.name, email: admin.email } });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Login failed", error: error.message });
+    }
+});
+
+// ADMIN - GET VOTERS
+app.get("/api/admin/voters", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [voters] = await conn.query("SELECT id, name as fullName, CONCAT('VOTER-', id) as voterId, email, phone, date_of_birth as dateOfBirth, has_voted as hasVoted, voted_at as votedAt, created_at as createdAt FROM voters ORDER BY created_at DESC");
+
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as totalVoters FROM voters");
+        const [[{ votedCount }]] = await conn.query("SELECT COUNT(*) as votedCount FROM voters WHERE has_voted = 1");
+
+        conn.release();
+        res.json({
+            success: true,
+            voters,
+            totalVoters: totalVoters || 0,
+            votedCount: votedCount || 0
+        });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - GET CANDIDATES
+app.get("/api/admin/candidates", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [candidates] = await conn.query("SELECT id, name, party, party_symbol as partySymbol, email, phone, biography, experience, policies, image_url as imageUrl, votes, status, created_at as createdAt FROM candidates ORDER BY created_at DESC");
+        conn.release();
+        res.json({ success: true, candidates });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - ADD CANDIDATE
+app.post("/api/admin/candidates", authenticateAdmin, uploadCandidateImage.single("image"), async (req, res) => {
+    let conn = null;
+    try {
+        const { name, party, email, phone, biography, experience, policies, partySymbol } = req.body;
+        let imageUrl = req.body.imageUrl || "https://via.placeholder.com/200?text=Candidate";
+        if (req.file) {
+            imageUrl = `/uploads/candidates/${req.file.filename}`;
+        }
+        conn = await pool.getConnection();
+        const [result] = await conn.query(
+            "INSERT INTO candidates (name, party, party_symbol, email, phone, biography, experience, policies, image_url, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+            [name, party, partySymbol || null, email || null, phone || null, biography || null, experience || null, policies || null, imageUrl]
+        );
+        conn.release();
+        res.json({ success: true, message: "Candidate added", candidateId: result.insertId });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - UPDATE CANDIDATE
+app.put("/api/admin/candidates/:id", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        const { id } = req.params;
+        const { name, party, biography, experience, policies, imageUrl, partySymbol, status, email, phone } = req.body;
+
+        console.log(`📝 Updating candidate ID: ${id}`);
+        console.log("📦 Body data:", req.body);
 
         conn = await pool.getConnection();
 
-        const [status] = await conn.query(
-            "SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1"
+        const [result] = await conn.query(
+            `UPDATE candidates SET 
+                name = ?, 
+                party = ?, 
+                biography = ?, 
+                experience = ?, 
+                policies = ?, 
+                image_url = ?, 
+                party_symbol = ?, 
+                status = ?,
+                email = ?,
+                phone = ?
+             WHERE id = ?`,
+            [name, party, biography, experience, policies, imageUrl, partySymbol, status || 'active', email || null, phone || null, id]
         );
 
+        console.log("📊 Query result:", result);
         conn.release();
 
-        if (!status.length) {
-            return res.json({
-                success: true,
-                status: 'CLOSED',
-                startTime: null,
-                endTime: null
+        if (result.affectedRows === 0) {
+            console.log("⚠️ No candidate found with that ID");
+            return res.status(404).json({
+                success: false,
+                message: "Candidate not found"
             });
         }
 
-        console.log("✅ Status:", status[0].status);
+        console.log("✅ Candidate updated successfully in DB");
 
         res.json({
             success: true,
-            status: status[0].status,
-            startTime: status[0].start_time,
-            endTime: status[0].end_time
+            message: "Candidate updated successfully"
         });
 
     } catch (error) {
-        console.error("❌ Status error:", error.message);
+        console.error("❌ Update error:", error.message);
         if (conn) conn.release();
         res.status(500).json({
             success: false,
-            message: "Failed",
+            message: "Failed to update candidate",
             error: error.message
         });
     }
 });
 
-// STATISTICS
-app.get("/api/admin/statistics", authenticateVoter, async (req, res) => {
+// ADMIN - DELETE CANDIDATE
+app.delete("/api/admin/candidates/:id", authenticateAdmin, async (req, res) => {
     let conn = null;
     try {
-        console.log("📈 Statistics");
+        conn = await pool.getConnection();
+        await conn.query("DELETE FROM candidates WHERE id = ?", [req.params.id]);
+        conn.release();
+        res.json({ success: true, message: "Candidate deleted" });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
 
+// ADMIN - START ELECTION
+app.post("/api/admin/election/start", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        const { duration } = req.body; // duration in seconds
         conn = await pool.getConnection();
 
-        const [[{ total_voters }]] = await conn.query(
-            "SELECT COUNT(*) as total_voters FROM voters"
-        );
+        // Deactivate any currently active/upcoming election
+        await conn.query("UPDATE election_control SET status = 'CLOSED' WHERE status IN ('ACTIVE', 'UPCOMING', 'PAUSED')");
 
-        const [[{ total_candidates }]] = await conn.query(
-            "SELECT COUNT(*) as total_candidates FROM candidates WHERE status = 'active'"
-        );
+        let endTime = null;
+        if (duration) {
+            endTime = new Date(Date.now() + duration * 1000);
+        }
 
-        const [[{ total_votes }]] = await conn.query(
-            "SELECT COUNT(*) as total_votes FROM votes"
-        );
+        await conn.query("INSERT INTO election_control (status, start_time, end_time) VALUES ('ACTIVE', CURRENT_TIMESTAMP, ?)", [endTime]);
+        conn.release();
+        res.json({ success: true, message: "Election started", endTime });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - STOP ELECTION
+app.post("/api/admin/election/stop", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        await conn.query("UPDATE election_control SET status = 'CLOSED', end_time = NOW() WHERE status IN ('ACTIVE', 'PAUSED', 'UPCOMING') ORDER BY id DESC LIMIT 1");
+        conn.release();
+        res.json({ success: true, message: "Election stopped" });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - PAUSE ELECTION
+app.post("/api/admin/election/pause", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        await conn.query("UPDATE election_control SET status = 'PAUSED' WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1");
+        conn.release();
+        res.json({ success: true, message: "Election paused" });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - EXTEND ELECTION
+app.post("/api/admin/election/extend", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        const { additionalMinutes } = req.body;
+        conn = await pool.getConnection();
+        await conn.query("UPDATE election_control SET end_time = DATE_ADD(end_time, INTERVAL ? MINUTE) WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1", [additionalMinutes]);
+        const [[{ newEndTime }]] = await conn.query("SELECT end_time as newEndTime FROM election_control WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1");
+        conn.release();
+        res.json({ success: true, message: "Election extended", newEndTime });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - RESUME ELECTION
+app.post("/api/admin/election/resume", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        await conn.query("UPDATE election_control SET status = 'ACTIVE' WHERE status = 'PAUSED' ORDER BY id DESC LIMIT 1");
+        conn.release();
+        res.json({ success: true, message: "Election resumed" });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - SCHEDULE ELECTION
+app.post("/api/admin/election/schedule", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        const { startTime, endTime } = req.body;
+        conn = await pool.getConnection();
+
+        const start = new Date(startTime);
+        const end = new Date(endTime);
+        const now = new Date();
+        const initialStatus = (start <= now) ? 'ACTIVE' : 'UPCOMING';
+
+        await conn.query("INSERT INTO election_control (status, start_time, end_time) VALUES (?, ?, ?)", [initialStatus, start, end]);
+        conn.release();
+        res.json({ success: true, message: `Election scheduled as ${initialStatus}` });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - ELECTION SETTINGS
+app.post("/api/admin/election/settings", authenticateAdmin, async (req, res) => {
+    // In a real app we'd save these to a settings table. For now just return success.
+    res.json({ success: true, message: "Settings updated" });
+});
+
+// ADMIN - DASHBOARD (Alias for statistics or extended)
+app.get("/api/admin/dashboard", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as totalVoters FROM voters");
+        const [[{ totalCandidates }]] = await conn.query("SELECT COUNT(*) as totalCandidates FROM candidates WHERE status = 'active'");
+        const [[{ totalVotes }]] = await conn.query("SELECT COUNT(*) as totalVotes FROM votes");
+        const [candidates] = await conn.query("SELECT id, name, party, party_symbol as partySymbol, votes FROM candidates WHERE status = 'active' ORDER BY votes DESC");
+        const [[{ election }]] = await conn.query("SELECT status FROM election_control ORDER BY id DESC LIMIT 1") || [{ status: 'CLOSED' }];
 
         conn.release();
 
-        console.log("✅ Statistics retrieved");
+        res.json({
+            success: true,
+            totalVoters: totalVoters || 0,
+            totalCandidates: totalCandidates || 0,
+            totalVotes: totalVotes || 0,
+            electionStatus: election ? election.status : 'CLOSED',
+            candidates: candidates || []
+        });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Dashboard failed", error: error.message });
+    }
+});
+
+// ADMIN - VOTERS EXPORT
+app.get("/api/admin/voters/export/csv", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [voters] = await conn.query("SELECT name, email, phone, has_voted as hasVoted, created_at FROM voters ORDER BY created_at DESC");
+        conn.release();
+
+        const csv = "Name,Email,Phone,Has Voted,Registered At\n" +
+            voters.map(v => `"${v.name}","${v.email}","${v.phone || ''}",${v.hasVoted === 1 ? 'Yes' : 'No'},"${v.created_at}"`).join("\n");
+
+        res.header("Content-Type", "text/csv");
+        res.attachment("voters_list.csv");
+        return res.send(csv);
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).send("Export failed");
+    }
+});
+
+// ADMIN - GENERATE REPORT
+app.post("/api/admin/generate-report", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [candidates] = await conn.query("SELECT name, party, votes FROM candidates WHERE status = 'active' ORDER BY votes DESC");
+        const [[{ totalVotes }]] = await conn.query("SELECT COUNT(*) as totalVotes FROM votes");
+        conn.release();
+
+        // Simple text report for now, simulating PDF generation
+        let report = `ELECTION REPORT - ${new Date().toLocaleDateString()}\n`;
+        report += `Total Votes Cast: ${totalVotes}\n\n`;
+        report += `RANKING:\n`;
+        candidates.forEach((c, i) => {
+            const pct = totalVotes > 0 ? ((c.votes / totalVotes) * 100).toFixed(1) : 0;
+            report += `${i + 1}. ${c.name} (${c.party}): ${c.votes} votes (${pct}%)\n`;
+        });
+
+        res.header("Content-Type", "text/plain");
+        res.attachment(`election_report_${Date.now()}.txt`);
+        return res.send(report);
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).send("Report generation failed");
+    }
+});
+
+// ADMIN - RESULTS
+app.get("/api/admin/results", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as totalVoters FROM voters");
+        const [candidates] = await conn.query(`
+            SELECT id, name, party, party_symbol as partySymbol, image_url as imageUrl, votes 
+            FROM candidates 
+            WHERE status = 'active' 
+            ORDER BY votes DESC
+        `);
+        const [[statusRow]] = await conn.query("SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1");
+        const electionStatus = statusRow ? getCalculatedStatus(statusRow.status, statusRow.start_time, statusRow.end_time) : 'CLOSED';
+
+        conn.release();
 
         res.json({
             success: true,
-            totalVoters: total_voters || 0,
-            totalCandidates: total_candidates || 0,
-            totalVotes: total_votes || 0
+            totalVoters: totalVoters || 0,
+            candidates: candidates.map(c => ({
+                ...c,
+                imageUrl: c.imageUrl || "https://via.placeholder.com/200?text=Candidate"
+            })),
+            electionStatus,
+            published: true
+        });
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).json({ success: false, message: "Failed", error: error.message });
+    }
+});
+
+// ADMIN - PUBLISH RESULTS
+app.post("/api/admin/results/publish", authenticateAdmin, async (req, res) => {
+    // In a real app we'd save this to DB, for now we just return success
+    res.json({ success: true, message: "Results published successfully" });
+});
+
+// ADMIN - EXPORT RESULTS CSV
+app.get("/api/admin/results/export/csv", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [candidates] = await conn.query("SELECT name, party, votes FROM candidates WHERE status = 'active' ORDER BY votes DESC");
+        conn.release();
+
+        const csv = "Name,Party,Votes\n" + candidates.map(c => `"${c.name}","${c.party}",${c.votes}`).join("\n");
+        res.header("Content-Type", "text/csv");
+        res.attachment("results.csv");
+        return res.send(csv);
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).send("Export failed");
+    }
+});
+
+// ADMIN - STATISTICS
+app.get("/api/admin/statistics", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+
+        // Get candidates and their real-time vote counts
+        const [candidates] = await conn.query(`
+            SELECT id, name, party, party_symbol as partySymbol, votes 
+            FROM candidates 
+            WHERE status = 'active'
+            ORDER BY votes DESC
+        `);
+
+        // Count total voters
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as totalVoters FROM voters");
+
+        // Count total candidates (active)
+        const [[{ totalCandidates }]] = await conn.query("SELECT COUNT(*) as totalCandidates FROM candidates WHERE status = 'active'");
+
+        // Get election status with dynamic calculation
+        const [[statusRow]] = await conn.query("SELECT status, start_time, end_time FROM election_control ORDER BY id DESC LIMIT 1");
+        const baseStatus = statusRow ? statusRow.status : 'CLOSED';
+        const electionStatus = statusRow ? getCalculatedStatus(baseStatus, statusRow.start_time, statusRow.end_time) : 'CLOSED';
+
+        // Calculate total votes
+        const totalVotes = candidates.reduce((sum, c) => sum + (c.votes || 0), 0);
+
+        conn.release();
+
+        res.json({
+            success: true,
+            candidates: candidates.map(c => ({
+                ...c,
+                percentage: totalVotes > 0 ? Math.round((c.votes / totalVotes) * 100) : 0
+            })),
+            totalVotes: totalVotes || 0,
+            totalVoters: totalVoters || 0,
+            totalCandidates: totalCandidates || 0,
+            electionStatus: electionStatus
         });
 
     } catch (error) {
-        console.error("❌ Statistics error:", error.message);
+        console.error("❌ Stats error:", error.message);
         if (conn) conn.release();
-        res.status(500).json({
-            success: false,
-            message: "Failed",
-            error: error.message
-        });
+        res.status(500).json({ success: false, message: "Failed to load statistics" });
+    }
+});
+
+// ADMIN - STATISTICS EXPORT CSV
+app.get("/api/admin/statistics/export/csv", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [candidates] = await conn.query("SELECT name, party, votes FROM candidates WHERE status = 'active' ORDER BY votes DESC");
+        conn.release();
+
+        const csv = "Name,Party,Votes,Percentage\n";
+        const total = candidates.reduce((s, c) => s + c.votes, 0);
+        const rows = candidates.map(c => {
+            const pct = total > 0 ? ((c.votes / total) * 100).toFixed(1) : 0;
+            return `"${c.name}","${c.party}",${c.votes},${pct}%`;
+        }).join("\n");
+
+        res.header("Content-Type", "text/csv");
+        res.attachment("statistics.csv");
+        return res.send(csv + rows);
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).send("Export failed");
+    }
+});
+
+// ADMIN - STATISTICS EXPORT JSON
+app.get("/api/admin/statistics/export/json", authenticateAdmin, async (req, res) => {
+    let conn = null;
+    try {
+        conn = await pool.getConnection();
+        const [[{ totalVoters }]] = await conn.query("SELECT COUNT(*) as total_voters FROM voters");
+        const [[{ totalVotes }]] = await conn.query("SELECT COUNT(*) as total_votes FROM votes");
+        const [candidates] = await conn.query("SELECT name, party, votes FROM candidates WHERE status = 'active' ORDER BY votes DESC");
+        conn.release();
+
+        const data = {
+            totalVoters,
+            totalVotes,
+            timestamp: new Date().toISOString(),
+            candidates: candidates.map(c => ({
+                ...c,
+                percentage: totalVotes > 0 ? ((c.votes / totalVotes) * 100).toFixed(1) : 0
+            }))
+        };
+
+        res.header("Content-Type", "application/json");
+        res.attachment("statistics.json");
+        return res.send(JSON.stringify(data, null, 2));
+    } catch (error) {
+        if (conn) conn.release();
+        res.status(500).send("Export failed");
     }
 });
 
 // ===========================
-// FRONTEND ROUTES
+// LEGACY HTML ROUTES (when React build is not used)
 // ===========================
 
-app.get("/index.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "index.html"));
-});
+if (!useReactClient) {
+    app.get("/index.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "index.html"));
+    });
 
-app.get("/login.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "login.html"));
-});
+    app.get("/login.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "login.html"));
+    });
 
-app.get("/register.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "register.html"));
-});
+    app.get("/register.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "register.html"));
+    });
 
-app.get("/dashboard.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "dashboard.html"));
-});
+    app.get("/dashboard.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "dashboard.html"));
+    });
 
-app.get("/voting.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "voting.html"));
-});
+    app.get("/voting.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "voting.html"));
+    });
 
-app.get("/profile.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "profile.html"));
-});
+    app.get("/profile.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "profile.html"));
+    });
 
-app.get("/results.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "results.html"));
-});
+    app.get("/results.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "results.html"));
+    });
 
-app.get("/success.html", (req, res) => {
-    res.sendFile(path.join(frontendPath, "success.html"));
-});
+    app.get("/success.html", (req, res) => {
+        res.sendFile(path.join(frontendPath, "success.html"));
+    });
+}
 
 // ===========================
 // FALLBACK ROUTES
@@ -695,6 +1251,17 @@ app.get("/success.html", (req, res) => {
 app.get("/health", (req, res) => {
     res.json({ status: "ok" });
 });
+
+// ===========================
+// REACT SPA (production build)
+// ===========================
+
+if (useReactClient) {
+    app.use((req, res, next) => {
+        if (req.method !== "GET" || req.path.startsWith("/api")) return next();
+        res.sendFile(path.join(reactDist, "index.html"));
+    });
+}
 
 // ===========================
 // ERROR HANDLERS
@@ -724,22 +1291,13 @@ app.listen(PORT, () => {
     console.log("\n" + "=".repeat(70));
     console.log("✅ VOTEHUB READY");
     console.log("=".repeat(70));
-    console.log(`
-
-✅ Admin: http://localhost:${PORT}/admin
-✅ Voter: http://localhost:${PORT}
-
-📚 Routes:
-   /index.html - Home
-   /login.html - Login
-   /register.html - Register
-   /dashboard.html - Dashboard
-   /voting.html - Vote
-   /profile.html - Profile
-   /results.html - Results
-   /css/* - Styles
-   /js/* - Scripts
-    `);
+    if (useReactClient) {
+        console.log(`\n✅ App (React): http://localhost:${PORT}/`);
+        console.log(`✅ Admin (React): http://localhost:${PORT}/admin/login\n`);
+    } else {
+        console.log(`\n✅ Admin: http://localhost:${PORT}/admin`);
+        console.log(`✅ Voter: http://localhost:${PORT}\n`);
+    }
     console.log("=".repeat(70) + "\n");
 });
 
