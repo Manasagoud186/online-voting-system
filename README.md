@@ -214,33 +214,75 @@ Techniques used:
 # 📂 Project Structure
 
 ```
-client/
+online-voting-system/
 │
-├── src/
-│   ├── admin/
-│   ├── components/
-│   ├── pages/
-│   ├── styles/
-│   ├── api.js
-│   └── App.jsx
+├── client/                           # React Frontend
+│   ├── public/
+│   │
+│   ├── src/
+│   │   ├── admin/                    # Admin Pages
+│   │   │   ├── AdminDashboardPage.jsx
+│   │   │   ├── AdminCandidatesPage.jsx
+│   │   │   ├── AdminAddCandidatePage.jsx
+│   │   │   ├── AdminElectionPage.jsx
+│   │   │   ├── AdminResultsPage.jsx
+│   │   │   ├── AdminStatisticsPage.jsx
+│   │   │   ├── AdminVotersPage.jsx
+│   │   │   ├── AdminLoginPage.jsx
+│   │   │   └── AdminLayout.jsx
+│   │   │
+│   │   ├── components/               # Reusable Components
+│   │   │   ├── ProtectedRoute.jsx
+│   │   │   └── VoterNav.jsx
+│   │   │
+│   │   ├── pages/                    # Voter Pages
+│   │   │   ├── HomePage.jsx
+│   │   │   ├── RegisterPage.jsx
+│   │   │   ├── LoginPage.jsx
+│   │   │   ├── DashboardPage.jsx
+│   │   │   ├── VotingPage.jsx
+│   │   │   ├── ResultsPage.jsx
+│   │   │   ├── ProfilePage.jsx
+│   │   │   └── SuccessPage.jsx
+│   │   │
+│   │   ├── styles/                   # Application Styling
+│   │   │   ├── admin.css
+│   │   │   ├── admin-login.css
+│   │   │   ├── voter.css
+│   │   │   ├── react-tweaks.css
+│   │   │   └── success-extra.css
+│   │   │
+│   │   ├── api.js                    # API Configuration
+│   │   ├── ToastContext.jsx          # Global Toast Notifications
+│   │   ├── App.jsx                   # Application Routes
+│   │   └── main.jsx                  # React Entry Point
+│   │
+│   ├── package.json
+│   └── vite.config.js
 │
-server.js
-database/
-seed-candidates.js
-package.json
+├── database/                         # Database Schema & SQL Scripts
+│   └── schema.sql
+│
+├── server.js                         # Express Server
+├── package.json                      # Backend Dependencies
+├── .env.example                      # Environment Variables Template
+│
+├── seed-candidates.js                # Seed Initial Candidate Data
+├── setup-db.js                       # Database Initialization
+├── import-voters.js                  # Import Voter Dataset
+├── update-voter-dobs.js              # Update Voter DOB Records
+│
+├── check-voters.js                   # Verify Imported Voters
+├── debug-password.js                 # Password Debug Utility
+├── debug-voter-specific.js           # Individual Voter Debugging
+├── debug-voters.js                   # Voter Data Validation
+│
+├── voters.csv                        # Sample Voter Dataset
+├── voters_check.json                 # Validation Output
+│
+├── .gitignore
+└── README.md
 ```
-
----
-
-# 🚀 Installation
-
-## Clone Repository
-
-```bash
-git clone https://github.com/yourusername/online-voting-system.git
-```
-
----
 
 ## Install Dependencies
 
@@ -301,14 +343,24 @@ npm run dev
 
 # 📸 Screenshots
 
-> Add screenshots of:
+## Home Page
+<img width="996" height="436" alt="image" src="https://github.com/user-attachments/assets/e95e57cf-160f-40bc-951d-7fe71d008e7c" />
 
-- Home Page
-- Login
-- Registration
-- Voting Page
-- Admin Dashboard
-- Results Page
+## Login
+<img width="995" height="502" alt="image" src="https://github.com/user-attachments/assets/67b4f99a-a2e3-43fb-a62c-8ec1d51d9cfa" />
+
+## Voting Page
+<img width="975" height="697" alt="image" src="https://github.com/user-attachments/assets/9a275212-f73d-4f2b-8db1-de7ba8a9db5d" />
+
+## Admin Dashboard
+<img width="924" height="427" alt="image" src="https://github.com/user-attachments/assets/233ccceb-631d-4a75-9cc6-31439e0594ef" />
+
+<img width="970" height="448" alt="image" src="https://github.com/user-attachments/assets/bca38f45-a802-4666-ba8c-1b9a7ed1057b" />
+
+
+
+## Results Page
+<img width="935" height="661" alt="image" src="https://github.com/user-attachments/assets/18bd9b32-4bae-4eb7-8df9-f488e0f0bde1" />
 
 ---
 
@@ -350,9 +402,9 @@ B.Tech Computer Science & Engineering (Data Science)
 
 Passionate about Full Stack Development, Backend Systems, Databases, and Software Engineering.
 
-LinkedIn: *Add your profile*
+LinkedIn: *https://www.linkedin.com/in/gurram-varshini-96008231a/*
 
-GitHub: *Add your GitHub profile*
+GitHub: *https://github.com/Varshinigurram*
 
 ---
 
